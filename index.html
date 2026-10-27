@@ -159,6 +159,7 @@ button, input, select { font: inherit; color: inherit; }
 .microw { display: flex; gap: 8px; margin-top: 8px; }
 .microw select { height: 44px; width: 104px; padding: 0 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
 .microw .mic { width: auto; flex: 1; margin-top: 0; }
+.subh { margin-top: 6px; padding-top: 14px; border-top: 1px solid var(--line); }
 .qactions .secondary { flex: 1; min-width: 130px; }
 .mic.listening { background: var(--accent); color: var(--accent-ink); }
 .qlist { display: flex; flex-direction: column; gap: 10px; }
@@ -276,6 +277,20 @@ button, input, select { font: inherit; color: inherit; }
           <input id="b-file" type="file" accept="application/json,.json" hidden>
         </div>
         <p class="msg" id="b-msg" role="status" aria-live="polite"></p>
+        <h3 class="subh">Cloud sync (Google Sheet)</h3>
+        <div class="field">
+          <label for="y-url">Web app URL</label>
+          <input id="y-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="y-key">Secret</label>
+          <input id="y-key" type="password" autocomplete="off" placeholder="The secret from your script">
+        </div>
+        <div class="qactions">
+          <button class="primary" id="y-save" type="button">Connect and sync</button>
+          <button class="secondary" id="y-off" type="button">Disconnect</button>
+        </div>
+        <p class="msg" id="y-msg" role="status" aria-live="polite"></p>
       </div>
     </div>
 
@@ -304,6 +319,7 @@ button, input, select { font: inherit; color: inherit; }
 
   var state = {
     expenses: [],
+    pending: [],
     settings: { budget: 0, currency: 'SAR' },
     view: null,
     mode: 'pending',   // pending | db | local
@@ -361,25 +377,117 @@ button, input, select { font: inherit; color: inherit; }
         var o = JSON.parse(raw);
         if (o && Array.isArray(o.expenses)) { state.expenses = o.expenses; }
         if (o && o.settings) { state.settings = Object.assign(state.settings, o.settings); }
+        if (o && Array.isArray(o.pendingDeletes)) { state.pending = o.pendingDeletes; }
       }
     } catch (e) { /* storage unavailable: run in memory */ }
   }
   function writeLocal() {
-    try { localStorage.setItem(LOCAL_KEY, JSON.stringify({ expenses: state.expenses, settings: state.settings })); } catch (e) { /* ignore */ }
+    try { localStorage.setItem(LOCAL_KEY, JSON.stringify({ expenses: state.expenses, settings: state.settings, pendingDeletes: state.pending })); } catch (e) { /* ignore */ }
+  }
+
+  /* ---------- Google Sheet sync ---------- */
+  var SYNC_KEY = 'expense-ledger-sync';
+  var syncBusy = false;
+  var lastSyncOk = false;
+  var syncCfg = loadSyncCfg();
+
+  function loadSyncCfg() {
+    try {
+      var o = JSON.parse(localStorage.getItem(SYNC_KEY) || 'null');
+      if (o && o.url && o.key) { return { url: String(o.url), key: String(o.key) }; }
+    } catch (e) { /* ignore */ }
+    return { url: '', key: '' };
+  }
+  function saveSyncCfg() {
+    try { localStorage.setItem(SYNC_KEY, JSON.stringify(syncCfg)); } catch (e) { /* ignore */ }
+  }
+  function syncOn() { return !!(syncCfg.url && syncCfg.key); }
+  function setSync(text, isErr) {
+    var n = $('storage-status');
+    n.textContent = text;
+    n.style.color = isErr ? 'var(--bad)' : '';
+  }
+  function plain(e) { return { id: e.id, amount: e.amount, category: e.category, date: e.date, note: e.note, createdAt: e.createdAt }; }
+  function remote(action, payload) {
+    return fetch(syncCfg.url, { method: 'POST', body: JSON.stringify(Object.assign({ key: syncCfg.key, action: action }, payload || {})) })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { if (!j || !j.ok) { throw new Error((j && j.error) || 'Sync failed'); } return j; });
+  }
+
+  async function syncAll() {
+    if (!syncOn() || syncBusy) { return; }
+    syncBusy = true;
+    lastSyncOk = false;
+    setSync('Syncing…', false);
+    try {
+      var left = [];
+      for (var i = 0; i < state.pending.length; i++) {
+        try { await remote('remove', { id: state.pending[i] }); } catch (e) { left.push(state.pending[i]); }
+      }
+      state.pending = left;
+      var unsynced = state.expenses.filter(function (e) { return !e.synced; }).map(plain);
+      if (unsynced.length) { await remote('addMany', { expenses: unsynced }); }
+      var res = await remote('list');
+      var gone = {};
+      state.pending.forEach(function (id) { gone[id] = true; });
+      state.expenses = (res.expenses || [])
+        .filter(function (e) { return e && e.id && isFinite(e.amount) && typeof e.date === 'string' && !gone[e.id]; })
+        .map(function (e) { return { id: String(e.id), amount: +e.amount, category: e.category || 'Other', date: e.date, note: e.note || '', createdAt: +e.createdAt || 0, synced: true }; });
+      if (res.settings) {
+        state.settings = { budget: +res.settings.budget || 0, currency: res.settings.currency || 'SAR' };
+      } else {
+        await remote('settings', { settings: state.settings });
+      }
+      writeLocal();
+      syncControls(true);
+      render();
+      lastSyncOk = true;
+      setSync('Synced with your Google Sheet at ' + new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }) + '.', false);
+    } catch (err) {
+      setSync('Could not sync (' + ((err && err.message) || 'network error') + '). Entries are kept on this device and will sync later.', true);
+    }
+    syncBusy = false;
   }
 
   function startLocal() {
     state.mode = 'local';
     readLocal();
     backend = {
-      add: function (exp) { state.expenses.push(exp); writeLocal(); render(); return Promise.resolve(); },
-      remove: function (id) { state.expenses = state.expenses.filter(function (e) { return e.id !== id; }); writeLocal(); render(); return Promise.resolve(); },
-      saveSettings: function () { writeLocal(); render(); return Promise.resolve(); }
+      add: function (exp) {
+        exp.synced = false;
+        state.expenses.push(exp);
+        writeLocal();
+        render();
+        if (!syncOn()) { return Promise.resolve(); }
+        return remote('add', { expense: plain(exp) })
+          .then(function () { exp.synced = true; writeLocal(); })
+          .catch(function () { setSync('Saved on this device. It will sync when the connection is back.', true); });
+      },
+      remove: function (id) {
+        state.expenses = state.expenses.filter(function (e) { return e.id !== id; });
+        writeLocal();
+        render();
+        if (!syncOn()) { return Promise.resolve(); }
+        return remote('remove', { id: id }).catch(function () {
+          state.pending.push(id);
+          writeLocal();
+          setSync('Deleted on this device. It will sync when the connection is back.', true);
+        });
+      },
+      saveSettings: function () {
+        writeLocal();
+        render();
+        if (!syncOn()) { return Promise.resolve(); }
+        return remote('settings', { settings: state.settings }).catch(function () {
+          setSync('Settings saved on this device. They will sync later.', true);
+        });
+      }
     };
-    $('storage-status').textContent = 'Saved on this device only. Use Download backup in Settings to copy your data elsewhere.';
+    setSync(syncOn() ? 'Saved on this device. Syncing to your Google Sheet…' : 'Saved on this device only. Add your Google Sheet link under Cloud sync in Settings to use the data on other devices.', false);
     state.ready = true;
     syncControls(true);
     render();
+    if (syncOn()) { syncAll(); }
   }
 
   function startDb(db, uid) {
@@ -923,10 +1031,43 @@ button, input, select { font: inherit; color: inherit; }
     });
   }
 
+  function initSync() {
+    function ymsg(t, err) { var m = $('y-msg'); m.textContent = t; m.className = 'msg' + (err ? ' err' : ''); }
+    $('y-url').value = syncCfg.url;
+    $('y-key').value = syncCfg.key;
+    $('y-save').addEventListener('click', function () {
+      var url = $('y-url').value.trim();
+      var key = $('y-key').value;
+      if (url.indexOf('https://script.google.com/') !== 0) { ymsg('Paste the Web app URL from Google Apps Script. It starts with https://script.google.com/', true); return; }
+      if (!key) { ymsg('Enter the secret you set in the script.', true); return; }
+      syncCfg = { url: url, key: key };
+      saveSyncCfg();
+      ymsg('Connecting…', false);
+      syncAll().then(function () {
+        ymsg(lastSyncOk ? 'Connected. Your entries now sync across devices.' : 'Could not connect. Check the URL and the secret, and that access is set to Anyone.', !lastSyncOk);
+      });
+    });
+    $('y-off').addEventListener('click', function () {
+      syncCfg = { url: '', key: '' };
+      saveSyncCfg();
+      state.expenses.forEach(function (e) { e.synced = false; });
+      state.pending = [];
+      writeLocal();
+      $('y-url').value = '';
+      $('y-key').value = '';
+      setSync('Saved on this device only. Add your Google Sheet link under Cloud sync in Settings to use the data on other devices.', false);
+      ymsg('Disconnected. Your entries stay on this device.', false);
+    });
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && syncOn() && state.ready) { syncAll(); }
+    });
+  }
+
   init();
   initQuick();
   initMic();
   initBackup();
+  initSync();
 })();
 </script>
 
