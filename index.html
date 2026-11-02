@@ -228,7 +228,7 @@ button, input, select { font: inherit; color: inherit; }
           </div>
         </form>
         <p class="msg" id="q-msg" role="status" aria-live="polite">To speak, tap the microphone key on your keyboard. You check every entry before it is saved.</p>
-        <details class="vlog"><summary>Voice log (v3)</summary><pre id="v-log">No voice activity yet.</pre></details>
+        <details class="vlog"><summary>Voice log (v4)</summary><pre id="v-log">No voice activity yet.</pre></details>
         <div id="q-preview" hidden></div>
       </section>
 
@@ -919,7 +919,7 @@ button, input, select { font: inherit; color: inherit; }
     quickItems = [];
     $('q-text').value = '';
     renderQuick();
-    $('q-text').focus();
+    if (!('ontouchstart' in window)) { $('q-text').focus(); }
   }
 
   function initQuick() {
@@ -948,9 +948,13 @@ button, input, select { font: inherit; color: inherit; }
     var lastEnd = 0;
     var watchdog = null;         // nobody spoke
     var stuckTimer = null;       // recognition "started" but no audio ever arrived
-    var COOLDOWN_MS = 450;       // let the browser release the microphone before the next session
+    var IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var shared = null;           // iPhone/iPad: reuse one recognition object between sessions
+    var soundTimer = null;       // audio is flowing but nothing was heard
+    var COOLDOWN_MS = IOS ? 1000 : 450;   // let the browser release the microphone before the next session
     var SILENCE_MS = 7000;
     var NO_AUDIO_MS = 3000;
+    var NO_SOUND_MS = 6000;
     var logLines = [];
     var t0 = Date.now();
 
@@ -968,9 +972,11 @@ button, input, select { font: inherit; color: inherit; }
     function release() {
       clearTimeout(watchdog);
       clearTimeout(stuckTimer);
+      clearTimeout(soundTimer);
       if (!rec) { return; }
       var old = rec;
       rec = null;
+      if (old === shared) { shared = null; }
       old.onstart = old.onresult = old.onerror = old.onend = old.onspeechstart = old.onaudiostart = old.onsoundstart = old.onspeechend = old.onaudioend = old.onnomatch = null;
       try { old.abort(); } catch (e) { /* already stopped */ }
     }
@@ -996,49 +1002,60 @@ button, input, select { font: inherit; color: inherit; }
       });
     }
 
+    function recover(reason, strategy) {
+      vlog(reason);
+      release();
+      if (strategy < 1) {
+        phase = 'starting';
+        setUi();
+        qflash('Restarting the microphone…', false);
+        setTimeout(function () { warmUp(function () { if (phase === 'starting') { begin(0, 1); } }); }, 900);
+      } else {
+        lastEnd = Date.now();
+        phase = 'idle';
+        setUi();
+        qflash('Still did not hear anything. If you were speaking, close this tab and open the page again, or use your keyboard’s microphone key.', true);
+      }
+    }
+
     function begin(attempt, strategy) {
-      var me = new SR();
+      var me = (IOS && shared) ? shared : new SR();
+      if (IOS) { shared = me; }
       rec = me;
-      var gotAudio = false, gotText = false, code = '';
+      var gotAudio = false, gotHeard = false, gotText = false, code = '';
       me.lang = $('q-lang').value;
       me.interimResults = true;
       me.continuous = false;
       me.maxAlternatives = 1;
       me.onstart = function () {
         if (rec !== me) { return; }
-        vlog('start' + (strategy ? ' (after warm-up)' : ''));
+        vlog('start' + (strategy ? ' (after warm-up)' : '') + (IOS ? ' [iOS]' : ''));
         phase = 'listening';
         setUi();
         qflash('Listening. Say something like “45 lunch, 20 fuel”.', false);
         watchdog = setTimeout(function () {
           if (rec === me) { vlog('silence timeout'); try { me.stop(); } catch (e) { /* ignore */ } }
         }, SILENCE_MS);
-        stuckTimer = setTimeout(function () {
-          if (rec !== me || gotAudio) { return; }
-          vlog('no audio arrived');
-          release();
-          if (strategy < 1) {
-            phase = 'starting';
-            setUi();
-            qflash('Restarting the microphone…', false);
-            setTimeout(function () { warmUp(function () { if (phase === 'starting') { begin(0, 1); } }); }, 900);
-          } else {
-            lastEnd = Date.now();
-            phase = 'idle';
-            setUi();
-            qflash('The microphone is not sending sound. Close this tab and open the page again, or use your keyboard’s microphone key.', true);
-          }
-        }, NO_AUDIO_MS);
+        stuckTimer = setTimeout(function () { if (rec === me && !gotAudio) { recover('no audio arrived', strategy); } }, NO_AUDIO_MS);
       };
-      me.onaudiostart = function () { if (rec !== me) { return; } gotAudio = true; clearTimeout(stuckTimer); vlog('audio capturing'); };
-      me.onsoundstart = function () { if (rec === me) { vlog('sound detected'); } };
-      me.onspeechstart = function () { if (rec !== me) { return; } gotAudio = true; clearTimeout(stuckTimer); clearTimeout(watchdog); vlog('speech detected'); };
+      me.onaudiostart = function () {
+        if (rec !== me) { return; }
+        gotAudio = true;
+        clearTimeout(stuckTimer);
+        vlog('audio capturing');
+        soundTimer = setTimeout(function () { if (rec === me && !gotHeard) { recover('audio flowing but nothing heard', strategy); } }, NO_SOUND_MS);
+      };
+      me.onsoundstart = function () { if (rec === me) { gotHeard = true; clearTimeout(soundTimer); vlog('sound detected'); } };
+      me.onspeechstart = function () { if (rec !== me) { return; } gotAudio = true; gotHeard = true; clearTimeout(stuckTimer); clearTimeout(soundTimer); clearTimeout(watchdog); vlog('speech detected'); };
       me.onspeechend = function () { if (rec === me) { vlog('speech ended'); } };
       me.onnomatch = function () { if (rec === me) { vlog('no match'); } };
       me.onresult = function (e) {
         if (rec !== me) { return; }
         gotAudio = true;
+        gotHeard = true;
         clearTimeout(stuckTimer);
+        clearTimeout(soundTimer);
+        clearTimeout(watchdog);
         var t = '';
         for (var i = 0; i < e.results.length; i++) { t += e.results[i][0].transcript; }
         if (t.trim()) { gotText = true; $('q-text').value = t; vlog('heard: ' + t); }
@@ -1048,6 +1065,7 @@ button, input, select { font: inherit; color: inherit; }
         if (rec !== me) { return; }
         clearTimeout(watchdog);
         clearTimeout(stuckTimer);
+        clearTimeout(soundTimer);
         rec = null;
         lastEnd = Date.now();
         phase = 'idle';
@@ -1082,6 +1100,7 @@ button, input, select { font: inherit; color: inherit; }
       if (phase === 'starting') { return; }
       t0 = Date.now();
       logLines = [];
+      if (document.activeElement && document.activeElement.blur) { document.activeElement.blur(); }   // close the keyboard so it does not hold the microphone
       if (!SR) {
         vlog('speech recognition not supported');
         $('q-text').focus();
