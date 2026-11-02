@@ -940,50 +940,109 @@ button, input, select { font: inherit; color: inherit; }
     var label = $('q-mic-label');
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     var rec = null;
-    var listening = false;
-    var failed = false;
+    var phase = 'idle';          // idle | starting | listening
+    var lastEnd = 0;
+    var watchdog = null;
+    var COOLDOWN_MS = 450;       // let the browser release the microphone before the next session
+    var SILENCE_MS = 7000;       // give up if nothing is heard
 
-    function setListening(on) {
-      listening = on;
+    function setUi() {
+      var on = phase !== 'idle';
       btn.classList.toggle('listening', on);
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-      label.textContent = on ? 'Listening… tap to stop' : 'Speak';
+      label.textContent = phase === 'listening' ? 'Listening… tap to stop' : phase === 'starting' ? 'Starting…' : 'Speak';
     }
-    function fallback() {
-      failed = true;
-      setListening(false);
-      $('q-text').focus();
-      qflash('Voice did not start. Allow microphone access for this site and use Chrome (Android) or Safari (iPhone), or tap the microphone key on your keyboard instead.', true);
+    function release() {
+      clearTimeout(watchdog);
+      if (!rec) { return; }
+      var old = rec;
+      rec = null;
+      old.onstart = old.onresult = old.onerror = old.onend = old.onspeechstart = null;
+      try { old.abort(); } catch (e) { /* already stopped */ }
+    }
+    function endMessage(code, gotText) {
+      if (code === 'not-allowed' || code === 'service-not-allowed') { return 'Microphone is blocked. Allow microphone access for this site in your browser settings, then tap Speak.'; }
+      if (code === 'audio-capture') { return 'No microphone found, or another app is using it. Close other apps that use the microphone and tap Speak.'; }
+      if (code === 'network') { return 'Voice needs an internet connection. Check it and tap Speak again.'; }
+      if (code === 'language-not-supported') { return 'This language is not supported for voice on your device. Pick another language.'; }
+      if (!gotText) { return 'Did not hear anything. Tap Speak and start talking right after it says Listening.'; }
+      return '';
+    }
+
+    function begin(attempt) {
+      var me = new SR();
+      rec = me;
+      var heard = false, gotText = false, code = '';
+      me.lang = $('q-lang').value;
+      me.interimResults = true;
+      me.continuous = false;
+      me.maxAlternatives = 1;
+      me.onstart = function () {
+        if (rec !== me) { return; }
+        phase = 'listening';
+        setUi();
+        qflash('Listening. Say something like “45 lunch, 20 fuel”.', false);
+        watchdog = setTimeout(function () {
+          if (rec === me && !heard) { try { me.stop(); } catch (e) { /* ignore */ } }
+        }, SILENCE_MS);
+      };
+      me.onspeechstart = function () { heard = true; clearTimeout(watchdog); };
+      me.onresult = function (e) {
+        if (rec !== me) { return; }
+        heard = true;
+        var t = '';
+        for (var i = 0; i < e.results.length; i++) { t += e.results[i][0].transcript; }
+        if (t.trim()) { gotText = true; $('q-text').value = t; }
+      };
+      me.onerror = function (e) { code = (e && e.error) || 'error'; };
+      me.onend = function () {
+        if (rec !== me) { return; }
+        clearTimeout(watchdog);
+        rec = null;
+        lastEnd = Date.now();
+        phase = 'idle';
+        setUi();
+        if (gotText && !code) {
+          $('q-form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+          return;
+        }
+        if (code === 'aborted') { return; }
+        var msg = endMessage(code, gotText);
+        if (msg) { qflash(msg, true); }
+      };
+      $('q-text').value = '';
+      try {
+        me.start();
+      } catch (err) {
+        rec = null;
+        if (attempt < 2) {
+          // the browser has not released the microphone yet: wait a little longer and try once more
+          setTimeout(function () { if (phase === 'starting') { begin(attempt + 1); } }, 700);
+          return;
+        }
+        phase = 'idle';
+        setUi();
+        qflash('The microphone was still busy. Wait a second and tap Speak again.', true);
+      }
     }
 
     btn.addEventListener('click', function () {
-      if (listening && rec) { rec.stop(); return; }
-      if (!SR) { fallback(); return; }
-      failed = false;
-      try {
-        rec = new SR();
-        rec.lang = $('q-lang').value;
-        rec.interimResults = true;
-        rec.continuous = false;
-        rec.onresult = function (e) {
-          var t = '';
-          for (var i = 0; i < e.results.length; i++) { t += e.results[i][0].transcript; }
-          $('q-text').value = t;
-        };
-        rec.onerror = function () { fallback(); };
-        rec.onend = function () {
-          setListening(false);
-          if (!failed && $('q-text').value.trim()) {
-            $('q-form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
-          }
-        };
-        $('q-text').value = '';
-        qflash('Listening. Say something like “45 lunch, 20 fuel”.', false);
-        rec.start();
-        setListening(true);
-      } catch (err) {
-        fallback();
+      if (phase === 'listening' && rec) { try { rec.stop(); } catch (e) { /* ignore */ } return; }
+      if (phase === 'starting') { return; }
+      if (!SR) {
+        $('q-text').focus();
+        qflash('Voice capture is not supported in this browser. Use Chrome on Android or Safari on iPhone, or tap the microphone key on your keyboard.', true);
+        return;
       }
+      release();
+      phase = 'starting';
+      setUi();
+      var wait = Math.max(0, COOLDOWN_MS - (Date.now() - lastEnd));
+      setTimeout(function () { if (phase === 'starting') { begin(0); } }, wait);
+    });
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden && rec) { try { rec.stop(); } catch (e) { /* ignore */ } }
     });
   }
 
