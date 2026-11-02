@@ -226,9 +226,10 @@ button, input, select { font: inherit; color: inherit; }
             <span id="q-mic-label">Speak</span>
           </button>
           </div>
+          <button class="linkbtn" id="q-kbd" type="button">Voice not working? Use the keyboard microphone</button>
         </form>
         <p class="msg" id="q-msg" role="status" aria-live="polite">To speak, tap the microphone key on your keyboard. You check every entry before it is saved.</p>
-        <details class="vlog"><summary>Voice log (v4)</summary><pre id="v-log">No voice activity yet.</pre></details>
+        <details class="vlog"><summary>Voice log (v5)</summary><pre id="v-log">No voice activity yet.</pre></details>
         <div id="q-preview" hidden></div>
       </section>
 
@@ -954,7 +955,7 @@ button, input, select { font: inherit; color: inherit; }
     var COOLDOWN_MS = IOS ? 1000 : 450;   // let the browser release the microphone before the next session
     var SILENCE_MS = 7000;
     var NO_AUDIO_MS = 3000;
-    var NO_SOUND_MS = 6000;
+    var NO_SOUND_MS = 4000;
     var logLines = [];
     var t0 = Date.now();
 
@@ -1113,6 +1114,12 @@ button, input, select { font: inherit; color: inherit; }
       setUi();
       var wait = Math.max(0, COOLDOWN_MS - (Date.now() - lastEnd));
       setTimeout(function () { if (phase === 'starting') { begin(0, 0); } }, wait);
+    });
+
+    $('q-kbd').addEventListener('click', function () {
+      if (rec) { release(); phase = 'idle'; setUi(); }
+      $('q-text').focus();
+      qflash('Tap the microphone key on your keyboard (bottom corner), say your expenses, then tap Read.', false);
     });
 
     document.addEventListener('visibilitychange', function () {
