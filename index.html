@@ -156,6 +156,9 @@ button, input, select { font: inherit; color: inherit; }
 .secondary { height: 44px; padding: 0 16px; border: 1px solid var(--accent); background: transparent; color: var(--accent); border-radius: 8px; font-weight: 600; cursor: pointer; }
 .secondary:hover { background: var(--accent-soft); }
 .mic { width: 100%; margin-top: 8px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.vlog { font-size: 12.5px; color: var(--muted); }
+.vlog summary { cursor: pointer; }
+.vlog pre { margin: 6px 0 0; padding: 8px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink); }
 .microw { display: flex; gap: 8px; margin-top: 8px; }
 .microw select { height: 44px; width: 104px; padding: 0 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
 .microw .mic { width: auto; flex: 1; margin-top: 0; }
@@ -225,6 +228,7 @@ button, input, select { font: inherit; color: inherit; }
           </div>
         </form>
         <p class="msg" id="q-msg" role="status" aria-live="polite">To speak, tap the microphone key on your keyboard. You check every entry before it is saved.</p>
+        <details class="vlog"><summary>Voice log (v3)</summary><pre id="v-log">No voice activity yet.</pre></details>
         <div id="q-preview" hidden></div>
       </section>
 
@@ -942,10 +946,19 @@ button, input, select { font: inherit; color: inherit; }
     var rec = null;
     var phase = 'idle';          // idle | starting | listening
     var lastEnd = 0;
-    var watchdog = null;
+    var watchdog = null;         // nobody spoke
+    var stuckTimer = null;       // recognition "started" but no audio ever arrived
     var COOLDOWN_MS = 450;       // let the browser release the microphone before the next session
-    var SILENCE_MS = 7000;       // give up if nothing is heard
+    var SILENCE_MS = 7000;
+    var NO_AUDIO_MS = 3000;
+    var logLines = [];
+    var t0 = Date.now();
 
+    function vlog(text) {
+      logLines.push(((Date.now() - t0) / 1000).toFixed(1) + 's ' + text);
+      if (logLines.length > 16) { logLines.shift(); }
+      $('v-log').textContent = logLines.join('\n');
+    }
     function setUi() {
       var on = phase !== 'idle';
       btn.classList.toggle('listening', on);
@@ -954,10 +967,11 @@ button, input, select { font: inherit; color: inherit; }
     }
     function release() {
       clearTimeout(watchdog);
+      clearTimeout(stuckTimer);
       if (!rec) { return; }
       var old = rec;
       rec = null;
-      old.onstart = old.onresult = old.onerror = old.onend = old.onspeechstart = null;
+      old.onstart = old.onresult = old.onerror = old.onend = old.onspeechstart = old.onaudiostart = old.onsoundstart = old.onspeechend = old.onaudioend = old.onnomatch = null;
       try { old.abort(); } catch (e) { /* already stopped */ }
     }
     function endMessage(code, gotText) {
@@ -968,40 +982,77 @@ button, input, select { font: inherit; color: inherit; }
       if (!gotText) { return 'Did not hear anything. Tap Speak and start talking right after it says Listening.'; }
       return '';
     }
+    function warmUp(next) {
+      // open and close the microphone once so the browser re-acquires it cleanly
+      var md = navigator.mediaDevices;
+      if (!md || !md.getUserMedia) { setTimeout(next, 500); return; }
+      md.getUserMedia({ audio: true }).then(function (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        vlog('mic warm-up ok');
+        setTimeout(next, 600);
+      }, function (err) {
+        vlog('mic warm-up failed: ' + ((err && err.name) || 'error'));
+        setTimeout(next, 300);
+      });
+    }
 
-    function begin(attempt) {
+    function begin(attempt, strategy) {
       var me = new SR();
       rec = me;
-      var heard = false, gotText = false, code = '';
+      var gotAudio = false, gotText = false, code = '';
       me.lang = $('q-lang').value;
       me.interimResults = true;
       me.continuous = false;
       me.maxAlternatives = 1;
       me.onstart = function () {
         if (rec !== me) { return; }
+        vlog('start' + (strategy ? ' (after warm-up)' : ''));
         phase = 'listening';
         setUi();
         qflash('Listening. Say something like “45 lunch, 20 fuel”.', false);
         watchdog = setTimeout(function () {
-          if (rec === me && !heard) { try { me.stop(); } catch (e) { /* ignore */ } }
+          if (rec === me) { vlog('silence timeout'); try { me.stop(); } catch (e) { /* ignore */ } }
         }, SILENCE_MS);
+        stuckTimer = setTimeout(function () {
+          if (rec !== me || gotAudio) { return; }
+          vlog('no audio arrived');
+          release();
+          if (strategy < 1) {
+            phase = 'starting';
+            setUi();
+            qflash('Restarting the microphone…', false);
+            setTimeout(function () { warmUp(function () { if (phase === 'starting') { begin(0, 1); } }); }, 900);
+          } else {
+            lastEnd = Date.now();
+            phase = 'idle';
+            setUi();
+            qflash('The microphone is not sending sound. Close this tab and open the page again, or use your keyboard’s microphone key.', true);
+          }
+        }, NO_AUDIO_MS);
       };
-      me.onspeechstart = function () { heard = true; clearTimeout(watchdog); };
+      me.onaudiostart = function () { if (rec !== me) { return; } gotAudio = true; clearTimeout(stuckTimer); vlog('audio capturing'); };
+      me.onsoundstart = function () { if (rec === me) { vlog('sound detected'); } };
+      me.onspeechstart = function () { if (rec !== me) { return; } gotAudio = true; clearTimeout(stuckTimer); clearTimeout(watchdog); vlog('speech detected'); };
+      me.onspeechend = function () { if (rec === me) { vlog('speech ended'); } };
+      me.onnomatch = function () { if (rec === me) { vlog('no match'); } };
       me.onresult = function (e) {
         if (rec !== me) { return; }
-        heard = true;
+        gotAudio = true;
+        clearTimeout(stuckTimer);
         var t = '';
         for (var i = 0; i < e.results.length; i++) { t += e.results[i][0].transcript; }
-        if (t.trim()) { gotText = true; $('q-text').value = t; }
+        if (t.trim()) { gotText = true; $('q-text').value = t; vlog('heard: ' + t); }
       };
-      me.onerror = function (e) { code = (e && e.error) || 'error'; };
+      me.onerror = function (e) { code = (e && e.error) || 'error'; vlog('error: ' + code); };
       me.onend = function () {
         if (rec !== me) { return; }
         clearTimeout(watchdog);
+        clearTimeout(stuckTimer);
         rec = null;
         lastEnd = Date.now();
         phase = 'idle';
         setUi();
+        vlog('end');
         if (gotText && !code) {
           $('q-form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
           return;
@@ -1015,9 +1066,9 @@ button, input, select { font: inherit; color: inherit; }
         me.start();
       } catch (err) {
         rec = null;
+        vlog('start() threw: ' + ((err && err.name) || 'error'));
         if (attempt < 2) {
-          // the browser has not released the microphone yet: wait a little longer and try once more
-          setTimeout(function () { if (phase === 'starting') { begin(attempt + 1); } }, 700);
+          setTimeout(function () { if (phase === 'starting') { begin(attempt + 1, strategy); } }, 700);
           return;
         }
         phase = 'idle';
@@ -1027,18 +1078,22 @@ button, input, select { font: inherit; color: inherit; }
     }
 
     btn.addEventListener('click', function () {
-      if (phase === 'listening' && rec) { try { rec.stop(); } catch (e) { /* ignore */ } return; }
+      if (phase === 'listening' && rec) { vlog('tapped stop'); try { rec.stop(); } catch (e) { /* ignore */ } return; }
       if (phase === 'starting') { return; }
+      t0 = Date.now();
+      logLines = [];
       if (!SR) {
+        vlog('speech recognition not supported');
         $('q-text').focus();
         qflash('Voice capture is not supported in this browser. Use Chrome on Android or Safari on iPhone, or tap the microphone key on your keyboard.', true);
         return;
       }
+      vlog('tapped Speak (' + $('q-lang').value + ')');
       release();
       phase = 'starting';
       setUi();
       var wait = Math.max(0, COOLDOWN_MS - (Date.now() - lastEnd));
-      setTimeout(function () { if (phase === 'starting') { begin(0); } }, wait);
+      setTimeout(function () { if (phase === 'starting') { begin(0, 0); } }, wait);
     });
 
     document.addEventListener('visibilitychange', function () {
